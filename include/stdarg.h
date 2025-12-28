@@ -1,0 +1,121 @@
+/*
+ * stdarg.h - Variable Argument Lists
+ * CAST C Compiler - Standard C Library Header
+ * 
+ * Implements C99/C11 variable argument list support for the CAST VM.
+ * 
+ * Stack Layout for Variadic Functions (after ENT3):
+ *   Stack Args      (args 8+, caller's frame)
+ *   [arg9]          ← bp[+3]
+ *   [arg8]          ← bp[+2]   (first stack arg)
+ *   [ret_addr]      ← bp[+1]
+ *   [old_bp]        ← bp[+0]   (base pointer points here)
+ *   ---- callee frame below ----
+ *   [param0]        ← bp[-1]   (spilled from REG_A0)
+ *   [param1]        ← bp[-2]   (spilled from REG_A1)
+ *   ...
+ *   [param7]        ← bp[-8]   (spilled from REG_A7, last register arg)
+ *   [locals...]     ← bp[-9] and below
+ * 
+ * Register-based calling: first 8 args in REG_A0-A7, spilled by ENT3.
+ * Args 9+ are pushed to stack before CALL, remain in caller's frame.
+ * 
+ * va_list is a struct that tracks position in both regions and knows
+ * when to switch from the register-spill area to the stack args area.
+ */
+
+#ifndef _STDARG_H
+#define _STDARG_H
+
+/* 
+ * va_list type: struct tracking position in two memory regions
+ * - reg_ptr: current position in spilled register area (bp[-1...-8])
+ * - stack_ptr: current position in stack args area (bp[+2...])
+ * - reg_count: number of register-spill slots remaining before switching
+ */
+typedef struct {
+    char *reg_ptr;      /* Current position in register spill area */
+    char *stack_ptr;    /* Current position in stack overflow area */
+    int reg_count;      /* Remaining slots in register spill area */
+} va_list;
+
+/*
+ * va_start(ap, last) - Initialize va_list
+ * @ap:   va_list to initialize
+ * @last: name of the last fixed parameter before '...'
+ * 
+ * Computes:
+ * - reg_ptr: address of first variadic arg = &last - 8 (one slot before last)
+ * - stack_ptr: address of first stack arg = bp + 16 (bp[+2])
+ * - reg_count: how many varargs fit in remaining register spill slots
+ * 
+ * Stack geometry: last is at bp[-(param_idx+1)], bp[-8] is last reg slot.
+ * reg_count = 8 - (param_idx + 1) = 7 - param_idx
+ * 
+ * We compute this by measuring distance from last to bp[-8]:
+ * bp[-8] = bp - 64, and &last = bp - (param_idx+1)*8
+ * Distance in slots = (bp - (param_idx+1)*8) - (bp - 64) / 8 = (64 - (param_idx+1)*8) / 8
+ *                   = 8 - param_idx - 1 = 7 - param_idx
+ *
+ * Simpler: reg_count = (reg_end - &last) / 8 - 1 where reg_end is at a known offset.
+ * 
+ * The trick: bp can be recovered as ((long long *)&last) + (param_offset / 8)
+ * where param_offset = &last's position below bp. But param_offset is encoded
+ * in the stack layout.
+ *
+ * Practical approach: From &last, we walk back to find bp. ENT3 stores old_bp
+ * at bp[-0], but we have a simpler method: assume fixed params start at bp[-1].
+ * The number of fixed params = (&(bp[-1]) - &last) / 8 + 1.
+ *
+ * Since we can't easily find bp from &last alone, we use __builtin_frame_address.
+ * CAST compiles this to LEA 0 which gives bp.
+ */
+#define va_start(ap, last) do { \
+    long long *__bp = (long long *)__builtin_frame_address(0); \
+    (ap).reg_ptr = (char *)((long long *)&(last) - 1); \
+    (ap).stack_ptr = (char *)(__bp + 2); \
+    /* Count remaining reg slots: last is at __bp[-(N+1)], reg area ends at __bp[-8] */ \
+    /* Remaining = 8 - (N+1) = number of slots from (last-1) down to __bp[-8] */ \
+    int __param_slot = (int)(__bp - (long long *)&(last)); \
+    (ap).reg_count = 8 - __param_slot; \
+    if ((ap).reg_count < 0) (ap).reg_count = 0; \
+} while(0)
+
+/*
+ * va_arg(ap, type) - Retrieve next argument
+ * @ap:   va_list to read from
+ * @type: type of the argument to retrieve
+ * 
+ * If reg_count > 0: read from reg_ptr, decrement both reg_ptr and reg_count
+ * Else: read from stack_ptr, increment stack_ptr
+ * 
+ * For floating-point types, we cast to double* to get correct IEEE 754 value.
+ */
+#define va_arg(ap, type) \
+    (((ap).reg_count > 0) \
+        ? (--((ap).reg_count), \
+           (__cast_types_compatible_p(type, double) || __cast_types_compatible_p(type, float) \
+               ? (*(double *)(((ap).reg_ptr) -= 8, ((ap).reg_ptr) + 8)) \
+               : (*(type *)(((ap).reg_ptr) -= 8, ((ap).reg_ptr) + 8)))) \
+        : (__cast_types_compatible_p(type, double) || __cast_types_compatible_p(type, float) \
+               ? (*(double *)(((ap).stack_ptr) += 8, ((ap).stack_ptr) - 8)) \
+               : (*(type *)(((ap).stack_ptr) += 8, ((ap).stack_ptr) - 8))))
+
+/*
+ * va_end(ap) - Cleanup va_list
+ * @ap: va_list to cleanup
+ * 
+ * No-op in this implementation. Included for C standard compliance.
+ */
+#define va_end(ap) ((void)0)
+
+/*
+ * va_copy(dest, src) - Copy va_list (C99)
+ * @dest: destination va_list
+ * @src:  source va_list
+ * 
+ * Struct assignment copies all fields.
+ */
+#define va_copy(dest, src) ((dest) = (src))
+
+#endif /* _STDARG_H */

@@ -1,0 +1,499 @@
+/*
+ CAST: C AST parser + preprocessor
+
+ Copyright (C) 2025 George Watson
+
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+
+ You should have received a copy of the GNU General Public License
+ along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+ This file was original part of chibicc by Rui Ueyama (MIT) https://github.com/rui314/chibicc
+*/
+
+#include "cast.h"
+#include "./internal.h"
+
+// Type sizes now match standard C sizes with proper VM instruction support:
+// char=1, short=2, int=4, long=8
+Type *ty_void = &(Type){TY_VOID, 1, 1};
+Type *ty_bool = &(Type){TY_BOOL, 1, 1};
+
+Type *ty_char = &(Type){TY_CHAR, 1, 1};
+Type *ty_short = &(Type){TY_SHORT, 2, 2};
+Type *ty_int = &(Type){TY_INT, 4, 4};
+Type *ty_long = &(Type){TY_LONG, 8, 8};
+
+Type *ty_uchar = &(Type){TY_CHAR, 1, 1, true};
+Type *ty_ushort = &(Type){TY_SHORT, 2, 2, true};
+Type *ty_uint = &(Type){TY_INT, 4, 4, true};
+Type *ty_ulong = &(Type){TY_LONG, 8, 8, true};
+
+Type *ty_float = &(Type){TY_FLOAT, 4, 4};
+Type *ty_double = &(Type){TY_DOUBLE, 8, 8};
+Type *ty_ldouble = &(Type){TY_LDOUBLE, 16, 16};
+
+static Type ty_error_obj = {TY_ERROR, 0, 1};
+Type *ty_error = &ty_error_obj;
+
+static Type *new_type(CAST *vm, TypeKind kind, int size, int align) {
+    Type *ty = arena_alloc(&vm->compiler.parser_arena, sizeof(Type));
+    memset(ty, 0, sizeof(Type));
+    ty->kind = kind;
+    ty->size = size;
+    ty->align = align;
+    return ty;
+}
+
+bool is_integer(Type *ty) {
+    if (!ty) return false;
+    TypeKind k = ty->kind;
+    return k == TY_BOOL || k == TY_CHAR || k == TY_SHORT ||
+    k == TY_INT  || k == TY_LONG || k == TY_ENUM;
+}
+
+bool is_flonum(Type *ty) {
+    if (!ty) return false;
+    return ty->kind == TY_FLOAT || ty->kind == TY_DOUBLE ||
+    ty->kind == TY_LDOUBLE;
+}
+
+bool is_numeric(Type *ty) {
+    if (!ty) return false;
+    return is_integer(ty) || is_flonum(ty);
+}
+
+bool is_error_type(Type *ty) {
+    return ty && ty->kind == TY_ERROR;
+}
+
+bool is_compatible(Type *t1, Type *t2) {
+    if (t1 == t2)
+        return true;
+
+    if (t1->origin)
+        return is_compatible(t1->origin, t2);
+
+    if (t2->origin)
+        return is_compatible(t1, t2->origin);
+
+    if (t1->kind != t2->kind)
+        return false;
+
+    switch (t1->kind) {
+        case TY_CHAR:
+        case TY_SHORT:
+        case TY_INT:
+        case TY_LONG:
+            return t1->is_unsigned == t2->is_unsigned;
+        case TY_FLOAT:
+        case TY_DOUBLE:
+        case TY_LDOUBLE:
+            return true;
+        case TY_PTR:
+            return is_compatible(t1->base, t2->base);
+        case TY_FUNC: {
+            if (!is_compatible(t1->return_ty, t2->return_ty))
+                return false;
+            if (t1->is_variadic != t2->is_variadic)
+                return false;
+
+            Type *p1 = t1->params;
+            Type *p2 = t2->params;
+            for (; p1 && p2; p1 = p1->next, p2 = p2->next)
+                if (!is_compatible(p1, p2))
+                    return false;
+            return p1 == NULL && p2 == NULL;
+        }
+        case TY_ARRAY:
+            if (!is_compatible(t1->base, t2->base))
+                return false;
+            return t1->array_len < 0 && t2->array_len < 0 &&
+            t1->array_len == t2->array_len;
+        default:
+            return false;
+    }
+}
+
+Type *copy_type(CAST *vm, Type *ty) {
+    Type *ret = arena_alloc(&vm->compiler.parser_arena, sizeof(Type));
+    *ret = *ty;
+    ret->origin = ty;
+    // Note: is_const is preserved through memcpy (*ret = *ty)
+    return ret;
+}
+
+Type *pointer_to(CAST *vm, Type *base) {
+    Type *ty = new_type(vm, TY_PTR, 8, 8);
+    ty->base = base;
+    ty->is_unsigned = true;
+    return ty;
+}
+
+Type *func_type(CAST *vm, Type *return_ty) {
+    // The C spec disallows sizeof(<function type>), but
+    // GCC allows that and the expression is evaluated to 1.
+    Type *ty = new_type(vm, TY_FUNC, 1, 1);
+    ty->return_ty = return_ty;
+    return ty;
+}
+
+Type *array_of(CAST *vm, Type *base, int len) {
+    Type *ty = new_type(vm, TY_ARRAY, base->size * len, base->align);
+    ty->base = base;
+    ty->array_len = len;
+    return ty;
+}
+
+Type *vla_of(CAST *vm, Type *base, Node *len) {
+    Type *ty = new_type(vm, TY_VLA, 8, 8);
+    ty->base = base;
+    ty->vla_len = len;
+    return ty;
+}
+
+Type *enum_type(CAST *vm) {
+    return new_type(vm, TY_ENUM, 4, 4);  // enums are int-sized (4 bytes)
+}
+
+Type *struct_type(CAST *vm) {
+    return new_type(vm, TY_STRUCT, 0, 1);
+}
+
+Type *union_type(CAST *vm) {
+    return new_type(vm, TY_UNION, 0, 1);
+}
+
+Type *block_type(CAST *vm, Type *return_ty, Type *params) {
+    Type *ty = new_type(vm, TY_BLOCK, 8, 8);  // Block pointers are 8 bytes
+    ty->return_ty = return_ty;
+    ty->params = params;
+    return ty;
+}
+
+// Integer promotion: Convert types smaller than int to int (C99 6.3.1.1)
+// char, short, and bit-fields promote to int if all values fit, else unsigned int
+static Type *integer_promotion(Type *ty) {
+    // Don't promote error types or NULL
+    if (!ty || ty->kind == TY_ERROR)
+        return ty;
+
+    if (!is_integer(ty))
+        return ty;
+
+    // Types smaller than int promote to int
+    if (ty->size < 4) {
+        // If it's unsigned and all values don't fit in int, promote to unsigned int
+        // But for char and short, int can hold all values of unsigned char/short
+        // Only need unsigned int if original type was already unsigned AND larger than what int can hold
+        // In our case, unsigned short max (65535) fits in int, so always promote to int
+        return ty_int;
+    }
+
+    return ty;
+}
+
+// Integer conversion rank (C99 6.3.1.1): long > int > short > char
+static int get_integer_rank(Type *ty) {
+    switch (ty->kind) {
+        case TY_LONG: return 4;
+        case TY_INT:  return 3;
+        case TY_SHORT: return 2;
+        case TY_CHAR: return 1;
+        case TY_BOOL: return 0;
+        case TY_ENUM: return 3;  // enums have same rank as int
+        default: return -1;
+    }
+}
+
+// Usual arithmetic conversions (C99 6.3.1.8)
+static Type *get_common_type(CAST *vm, Type *ty1, Type *ty2) {
+    // Handle error types - propagate error
+    if (!ty1 || !ty2 || ty1->kind == TY_ERROR || ty2->kind == TY_ERROR)
+        return ty_error;
+
+    // Handle pointer arithmetic
+    if (ty1->base)
+        return pointer_to(vm, ty1->base);
+
+    // Handle function pointers
+    if (ty1->kind == TY_FUNC)
+        return pointer_to(vm, ty1);
+    if (ty2->kind == TY_FUNC)
+        return pointer_to(vm, ty2);
+
+    // Step 1: If either operand has type long double, the other is converted to long double
+    if (ty1->kind == TY_LDOUBLE || ty2->kind == TY_LDOUBLE)
+        return ty_ldouble;
+    
+    // Step 2: Otherwise, if either operand has type double, the other is converted to double
+    if (ty1->kind == TY_DOUBLE || ty2->kind == TY_DOUBLE)
+        return ty_double;
+    
+    // Step 3: Otherwise, if either operand has type float, the other is converted to float
+    if (ty1->kind == TY_FLOAT || ty2->kind == TY_FLOAT)
+        return ty_float;
+
+    // Step 4: Otherwise, integer promotions are performed on both operands
+    ty1 = integer_promotion(ty1);
+    ty2 = integer_promotion(ty2);
+
+    // Step 5: If both operands have the same type, no further conversion is needed
+    if (ty1->kind == ty2->kind && ty1->is_unsigned == ty2->is_unsigned)
+        return ty1;
+
+    // Step 6: If both operands have signed integer types or both have unsigned integer types,
+    // the operand with lesser integer conversion rank is converted to the type of the operand with greater rank
+    if (ty1->is_unsigned == ty2->is_unsigned) {
+        return (get_integer_rank(ty1) >= get_integer_rank(ty2)) ? ty1 : ty2;
+    }
+
+    // Step 7: Otherwise, if the type of the operand with unsigned integer type has rank greater than
+    // or equal to the rank of the type of the other operand, the operand with signed integer type
+    // is converted to the type of the operand with unsigned integer type
+    Type *unsigned_ty = ty1->is_unsigned ? ty1 : ty2;
+    Type *signed_ty = ty1->is_unsigned ? ty2 : ty1;
+    
+    if (get_integer_rank(unsigned_ty) >= get_integer_rank(signed_ty))
+        return unsigned_ty;
+
+    // Step 8: Otherwise, if the type of the operand with signed integer type can represent all
+    // values of the type of the operand with unsigned integer type, the operand with unsigned
+    // integer type is converted to the type of the operand with signed integer type
+    if (signed_ty->size > unsigned_ty->size)
+        return signed_ty;
+
+    // Step 9: Otherwise, both operands are converted to the unsigned integer type corresponding
+    // to the type of the operand with signed integer type
+    Type *result = copy_type(vm, signed_ty);
+    result->is_unsigned = true;
+    return result;
+}
+
+// For many binary operators, we implicitly promote operands so that
+// both operands have the same type. Any integral type smaller than
+// int is always promoted to int. If the type of one operand is larger
+// than the other's (e.g. "long" vs. "int"), the smaller operand will
+// be promoted to match with the other.
+//
+// This operation is called the "usual arithmetic conversion".
+static void usual_arith_conv(CAST *vm, Node **lhs, Node **rhs) {
+    Type *ty = get_common_type(vm, (*lhs)->ty, (*rhs)->ty);
+    // Skip casting if we have error types - they propagate automatically
+    if (ty->kind == TY_ERROR)
+        return;
+    *lhs = new_cast(vm, *lhs, ty);
+    *rhs = new_cast(vm, *rhs, ty);
+}
+
+void add_type(CAST *vm, Node *node) {
+    if (!node || node->ty)
+        return;
+
+    add_type(vm, node->lhs);
+    add_type(vm, node->rhs);
+    add_type(vm, node->cond);
+    add_type(vm, node->then);
+    add_type(vm, node->els);
+    add_type(vm, node->init);
+    add_type(vm, node->inc);
+
+    for (Node *n = node->body; n; n = n->next)
+        add_type(vm, n);
+    for (Node *n2 = node->args; n2; n2 = n2->next)
+        add_type(vm, n2);
+
+    // Propagate error type from operands - prevents cascading errors
+    if ((node->lhs && node->lhs->ty && is_error_type(node->lhs->ty)) ||
+        (node->rhs && node->rhs->ty && is_error_type(node->rhs->ty)) ||
+        (node->cond && node->cond->ty && is_error_type(node->cond->ty))) {
+        node->ty = ty_error;
+        return;
+    }
+
+    switch (node->kind) {
+        case ND_NUM:
+            // Parser already sets the correct type from token (ty_double for 3.14, etc.)
+            // Don't override it here!
+            return;
+        case ND_ADD:
+        case ND_SUB:
+        case ND_MUL:
+        case ND_DIV:
+        case ND_MOD:
+        case ND_BITAND:
+        case ND_BITOR:
+        case ND_BITXOR:
+            usual_arith_conv(vm, &node->lhs, &node->rhs);
+            node->ty = node->lhs->ty;
+            return;
+        case ND_NEG: {
+            Type *ty = get_common_type(vm, ty_int, node->lhs->ty);
+            node->lhs = new_cast(vm, node->lhs, ty);
+            node->ty = ty;
+            return;
+        }
+        case ND_ASSIGN:
+            if (node->lhs->ty->kind == TY_ARRAY) {
+                if (vm->collect_errors && error_tok_recover(vm, node->lhs->tok,
+                                                             "not an lvalue")) {
+                    node->ty = ty_error;
+                    return;
+                }
+                error_tok(vm, node->lhs->tok, "not an lvalue");
+            }
+            // Check for const-correctness
+            // Allow initialization (when initializing_var is set and matches)
+            bool is_initialization = false;
+            if (node->lhs->kind == ND_VAR && node->lhs->var == vm->compiler.initializing_var)
+                is_initialization = true;
+
+            if (node->lhs->ty->is_const && !is_initialization) {
+                if (vm->collect_errors && error_tok_recover(vm, node->lhs->tok,
+                                                             "cannot assign to const-qualified variable")) {
+                    node->ty = ty_error;
+                    return;
+                }
+                error_tok(vm, node->lhs->tok, "cannot assign to const-qualified variable");
+            }
+            if (node->lhs->ty->kind != TY_STRUCT && node->lhs->ty->kind != TY_UNION)
+                node->rhs = new_cast(vm, node->rhs, node->lhs->ty);
+            node->ty = node->lhs->ty;
+            return;
+        case ND_EQ:
+        case ND_NE:
+        case ND_LT:
+        case ND_LE:
+            usual_arith_conv(vm, &node->lhs, &node->rhs);
+            node->ty = ty_int;
+            return;
+        case ND_FUNCALL:
+            node->ty = node->func_ty->return_ty;
+            return;
+        case ND_NOT:
+        case ND_LOGOR:
+        case ND_LOGAND:
+            node->ty = ty_int;
+            return;
+        case ND_BITNOT:
+        case ND_SHL:
+        case ND_SHR:
+            node->ty = node->lhs->ty;
+            return;
+        case ND_VAR:
+        case ND_VLA_PTR:
+            node->ty = node->var->ty;
+            // Function-to-pointer decay: when a function name is used as a value,
+            // it decays to a pointer to that function
+            if (node->var->ty->kind == TY_FUNC) {
+                node->ty = pointer_to(vm, node->var->ty);
+            }
+            return;
+        case ND_COND:
+            if (node->then->ty->kind == TY_VOID || node->els->ty->kind == TY_VOID) {
+                node->ty = ty_void;
+            } else {
+                usual_arith_conv(vm, &node->then, &node->els);
+                node->ty = node->then->ty;
+            }
+            return;
+        case ND_COMMA:
+            node->ty = node->rhs->ty;
+            return;
+        case ND_MEMBER:
+            node->ty = node->member->ty;
+            // If the struct/union is const, propagate const to member access
+            if (node->lhs && node->lhs->ty && node->lhs->ty->is_const) {
+                node->ty = copy_type(vm, node->ty);
+                node->ty->is_const = true;
+            }
+            return;
+        case ND_ADDR: {
+            Type *ty = node->lhs->ty;
+            if (ty->kind == TY_ARRAY)
+                node->ty = pointer_to(vm, ty->base);
+            else
+                node->ty = pointer_to(vm, ty);
+            return;
+        }
+        case ND_DEREF:
+            if (!node->lhs->ty->base) {
+                if (vm->collect_errors && error_tok_recover(vm, node->tok,
+                                                             "invalid pointer dereference")) {
+                    node->ty = ty_error;
+                    return;
+                }
+                error_tok(vm, node->tok, "invalid pointer dereference");
+            }
+            if (node->lhs->ty->base->kind == TY_VOID) {
+                if (vm->collect_errors && error_tok_recover(vm, node->tok,
+                                                             "dereferencing a void pointer")) {
+                    node->ty = ty_error;
+                    return;
+                }
+                error_tok(vm, node->tok, "dereferencing a void pointer");
+            }
+
+            // Dereferencing preserves the const-ness of the pointee
+            node->ty = node->lhs->ty->base;
+            return;
+        case ND_STMT_EXPR:
+            if (node->body) {
+                Node *stmt = node->body;
+                while (stmt->next)
+                    stmt = stmt->next;
+                if (stmt->kind == ND_EXPR_STMT) {
+                    node->ty = stmt->lhs->ty;
+                    return;
+                }
+            }
+            error_tok(vm, node->tok, "statement expression returning void is not supported");
+            return;
+        case ND_LABEL_VAL:
+            node->ty = pointer_to(vm, ty_void);
+            return;
+        case ND_CAS:
+            add_type(vm, node->cas_addr);
+            add_type(vm, node->cas_old);
+            add_type(vm, node->cas_new);
+            node->ty = ty_bool;
+
+            if (node->cas_addr->ty->kind != TY_PTR)
+                error_tok(vm, node->cas_addr->tok, "pointer expected");
+            if (node->cas_old->ty->kind != TY_PTR)
+                error_tok(vm, node->cas_old->tok, "pointer expected");
+            return;
+        case ND_EXCH:
+            if (node->lhs->ty->kind != TY_PTR)
+                error_tok(vm, node->cas_addr->tok, "pointer expected");
+            node->ty = node->lhs->ty->base;
+            return;
+        case ND_BLOCK_LITERAL:
+            // Block literal type is already set during parsing (TY_BLOCK)
+            // If not set, infer from block_fn
+            if (!node->ty && node->block_fn && node->block_fn->ty) {
+                node->ty = block_type(vm, node->block_fn->ty->return_ty, 
+                                      node->block_fn->ty->params);
+            }
+            return;
+        case ND_BLOCK_CALL:
+            // Block call returns the block's return type
+            add_type(vm, node->lhs);
+            if (node->lhs->ty && node->lhs->ty->kind == TY_BLOCK) {
+                node->ty = node->lhs->ty->return_ty ? node->lhs->ty->return_ty : ty_void;
+            } else {
+                node->ty = ty_int;  // Fallback
+            }
+            return;
+        default:
+            return;
+    }
+}
